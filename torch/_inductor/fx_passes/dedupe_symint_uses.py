@@ -44,6 +44,12 @@ class _SymHashingDict:
     def __contains__(self, key):
         return self._wrap_to_sym_expr_hash(key) in self.sym_hash_dict
 
+    def __str__(self):
+        return f"_SymHashingDict={self.sym_hash_dict}"
+
+    def __repr__(self):
+        return f"_SymHashingDict={self.sym_hash_dict}"
+
     def get(self, key, default=None):
         return self.sym_hash_dict.get(self._wrap_to_sym_expr_hash(key), default)
 
@@ -63,17 +69,28 @@ def dedupe_symints(graph: torch.fx.Graph):
     sym_dict = _SymHashingDict()
     resolvable_from_input_symints = set()
 
+    # print()
+    # print(graph)
+
     for node in graph.nodes:
         val = node.meta.get("val", None)
         if val is None or not isinstance(val, py_sym_types):
             continue
 
-        if node.op == "placeholder":
+        # print(f"[{node.op}] {node} - {val}")
+
+        if node.op == "placeholder" and val not in sym_dict:
             resolvable_from_input_symints.add(node)
             sym_dict[val] = node
         elif existing_node := sym_dict.get(val):
+            if node.op == "placeholder":
+                continue
+
+            existing_node = sym_dict.get(val)
             node.replace_all_uses_with(existing_node)
             graph.erase_node(node)
         elif all(n in resolvable_from_input_symints for n in node.all_input_nodes):
             sym_dict[val] = node
             resolvable_from_input_symints.add(node)
+
+    # print(graph)

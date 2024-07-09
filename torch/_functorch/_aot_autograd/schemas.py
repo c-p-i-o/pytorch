@@ -180,20 +180,49 @@ class SubclassCreationMeta:
     # We need to keep them around along with outer_size / outer_stride to plumb them
     # into __tensor_unflatten__
     attrs: Dict[str, Union["SubclassCreationMeta", None]]
-    outer_size: List[int]
-    outer_stride: List[int]
+    outer_size: List[Union[int, torch.SymInt]]
+    outer_stride: List[Union[int, torch.SymInt]]
     meta: Any
+    # This points to the index of the first size in the list of arguments
+    flat_tensor_extra_sizes_offset: int
     # Stores the original subclass itself.
     # This is needed because we need the autograd metadata on the original subclass
     # (this is guaranteed to be a wrapper subclass that holds a fake tensor,
     #  so holding onto this at runtime shouldn't leak memory)
-    # This field is nulled out after calling make_runtime_safe()
     original_subclass: Optional[torch.Tensor]
 
     # Used at runtime to determine the subclass type, so we don't need to save the original subclass
     original_subclass_type: Optional[type] = None
 
-    def creation_fn(self, all_args, *, is_runtime: bool):
+    def compute_outer_size(
+        self,
+        all_args,
+        *,
+        num_fw_outs_saved_for_bw: Optional[int] = None,
+        is_runtime: bool,
+    ):
+        def is_symbolic(xs):
+            return pytree.tree_any(lambda x: isinstance(x, torch.SymInt), xs)
+
+        if is_runtime and is_symbolic(self.outer_size):
+            start = len(all_args) - self.flat_tensor_extra_sizes_offset
+            end = start + len(self.outer_size)
+            if num_fw_outs_saved_for_bw:
+                start -= num_fw_outs_saved_for_bw
+                end -= num_fw_outs_saved_for_bw
+            it = iter(all_args[start:end])
+            return pytree.tree_map_only(
+                torch.SymInt, lambda _: next(it), self.outer_size
+            )
+        return self.outer_size
+
+    def creation_fn(
+        self,
+        all_args,
+        *,
+        num_fw_outs_saved_for_bw: Optional[int] = None,
+        is_runtime: bool,
+    ):
         inner_tensors = {}
 
         curr_start_idx = self.flat_tensor_start_idx
@@ -212,8 +241,14 @@ class SubclassCreationMeta:
         else:
             original_subclass_type = type(self.original_subclass)
 
+        outer_size = self.compute_outer_size(
+            all_args,
+            num_fw_outs_saved_for_bw=num_fw_outs_saved_for_bw,
+            is_runtime=is_runtime,
+        )
+
         rebuilt = original_subclass_type.__tensor_unflatten__(  # type: ignore[attr-defined]
-            inner_tensors, self.meta, self.outer_size, self.outer_stride
+            inner_tensors, self.meta, outer_size, self.outer_stride
         )
 
         if not is_runtime:
@@ -228,7 +263,6 @@ class SubclassCreationMeta:
     def make_runtime_safe(self):
         assert self.original_subclass is not None
         self.original_subclass_type = type(self.original_subclass)
-        self.original_subclass = None
         # Recurse on nested subclass info
         for creation_meta in self.attrs.values():
             if creation_meta is not None:

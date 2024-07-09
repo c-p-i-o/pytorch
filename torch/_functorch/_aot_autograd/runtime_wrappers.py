@@ -639,7 +639,11 @@ class AOTDispatchSubclassWrapper(CompilerWrapper):
         @wraps(compiled_fn)
         def inner_fn(args: List[Any]):
             unwrapped_args = unwrap_tensor_subclasses(
-                args, is_joint_structure=self.trace_joint
+                args,
+                subclass_metas=runtime_metadata.subclass_inp_meta,
+                is_joint_structure=self.trace_joint,
+                is_runtime=True,
+                append_extra=True,
             )
             args.clear()
             # expectation: runtime_fn is a boxed fn
@@ -1825,7 +1829,10 @@ To fix this, your tensor subclass must implement the dunder method __force_to_sa
                     len_tangents = len(
                         unwrap_tensor_subclasses(
                             tangents,
+                            subclass_metas=None,
                             is_joint_structure=False,
+                            is_runtime=True,
+                            append_extra=False,
                         )
                     )
                     assert CompiledFunction.metadata.traced_tangent_metas is not None
@@ -1840,10 +1847,44 @@ To fix this, your tensor subclass must implement the dunder method __force_to_sa
                         else t
                         for i, t in enumerate(all_args)
                     ]
-                    all_args = unwrap_tensor_subclasses(
-                        all_args, is_joint_structure=False
+
+                    metas = iter(CompiledFunction.metadata.subclass_tangent_meta)
+                    tangent_metadata = [
+                        next(metas)
+                        if isinstance(a, Tensor) and is_traceable_wrapper_subclass(a)
+                        else i
+                        for i, a in enumerate(all_args)
+                    ]
+
+                    # there should be a better way to get the number of extra symints
+                    len_extra_symints = len(
+                        unwrap_tensor_subclasses(
+                            all_args,
+                            subclass_metas=tangent_metadata,
+                            is_joint_structure=False,
+                            is_runtime=True,
+                            append_extra=True,
+                        )
+                    ) - len(
+                        unwrap_tensor_subclasses(
+                            all_args,
+                            subclass_metas=None,
+                            is_joint_structure=False,
+                            is_runtime=True,
+                            append_extra=False,
+                        )
                     )
-                    tangents_start_idx = len(all_args) - len_tangents - len(rng_args)
+
+                    all_args = unwrap_tensor_subclasses(
+                        all_args,
+                        subclass_metas=tangent_metadata,
+                        is_joint_structure=False,
+                        is_runtime=True,
+                        append_extra=True,
+                    )
+                    tangents_start_idx = (
+                        len(all_args) - len_tangents - len(rng_args) - len_extra_symints
+                    )
                     tangents_end_idx = tangents_start_idx + len_tangents
 
                 # Make the tangents contiguous. Note that we must do this after subclass desugaring
@@ -1978,6 +2019,7 @@ To fix this, your tensor subclass must implement the dunder method __force_to_sa
                     outs_wrapped = wrap_tensor_subclasses(
                         out,
                         subclass_metas=CompiledFunction.maybe_subclass_metadata.grad_input_metas,
+                        is_runtime=True,
                     )
                     return (*[None] * num_tokens, *outs_wrapped)
                 return (*[None] * num_tokens, *out)
@@ -2080,3 +2122,7 @@ def make_runtime_safe(
     fw_metadata.make_runtime_safe()
     if maybe_subclass_meta is not None:
         maybe_subclass_meta.fw_metadata.make_runtime_safe()
+        if maybe_subclass_meta.grad_input_metas:
+            for meta in maybe_subclass_meta.grad_input_metas:
+                if isinstance(meta, SubclassCreationMeta):
+                    meta.make_runtime_safe()
