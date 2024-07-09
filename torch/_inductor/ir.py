@@ -20,7 +20,6 @@ from typing import (
     List,
     Optional,
     Sequence,
-    Set,
     Tuple,
     TYPE_CHECKING,
     Union,
@@ -60,6 +59,7 @@ from torch.fx.experimental.symbolic_shapes import (
 )
 from torch.utils._sympy.functions import CleanDiv, FloorDiv, ModularIndexing
 from torch.utils._sympy.symbol import SymT
+from torch.utils.ordered_set import OrderedSet
 
 from . import config, dependencies
 from .codegen.common import BackendFeature, index_prevent_reordering
@@ -281,11 +281,11 @@ def is_cpu(x):
 
 
 class IRNode:
-    _current_origins: ClassVar[Set[Any]] = set()
+    _current_origins: ClassVar[OrderedSet[Any]] = OrderedSet()
 
     @staticmethod
     @contextlib.contextmanager
-    def current_origins(origins: Set[torch.fx.Node]):
+    def current_origins(origins: OrderedSet[torch.fx.Node]):
         old = IRNode._current_origins
         IRNode._current_origins = old | origins
         try:
@@ -294,10 +294,10 @@ class IRNode:
             IRNode._current_origins = old
 
     def __post_init__(self):
-        self.origins = set(self._current_origins)
+        self.origins = OrderedSet(self._current_origins)
         self.traceback = traceback.format_stack() if config.debug_ir_traceback else None
 
-    def get_read_names(self) -> Set[str]:
+    def get_read_names(self) -> OrderedSet[str]:
         raise NotImplementedError(f"NYI on {type(self)}")
 
     def get_traceback(self):
@@ -376,7 +376,7 @@ class IRNode:
     make_indexer: Callable[[], Callable[[Any], Any]]
     mark_reuse: Callable[[int], None]
     realize_hint: Callable[[], None]
-    get_unbacked_symbol_uses: Callable[[], Set[sympy.Symbol]]
+    get_unbacked_symbol_uses: Callable[[], OrderedSet[sympy.Symbol]]
 
 
 @dataclasses.dataclass
@@ -411,8 +411,8 @@ class Operation:
     def is_user_of(self, name):
         return name in self.get_read_names()
 
-    def get_read_names(self) -> Set[str]:
-        return {dep.name for dep in self.get_reads()}
+    def get_read_names(self) -> OrderedSet[str]:
+        return OrderedSet(dep.name for dep in self.get_reads())
 
     def get_reads(self):
         return self.get_read_writes().reads
@@ -420,10 +420,10 @@ class Operation:
     def get_outputs(self) -> List[Buffer]:
         raise NotImplementedError
 
-    def get_unbacked_symbol_defs(self) -> Set[sympy.Symbol]:
-        return set()
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
 
-    def get_unbacked_symbol_uses(self) -> Set[sympy.Symbol]:
+    def get_unbacked_symbol_uses(self) -> OrderedSet[sympy.Symbol]:
         """
         Returns the unbacked symbols which are required to be in scope in
         order to successfully perform codegen for this buffer.  For example,
@@ -438,7 +438,7 @@ class Operation:
         on that buffer, which will eventually have a dependency on i0 if
         necessary.
         """
-        return set()
+        return OrderedSet()
 
     def get_workspace_size(self):
         """
@@ -455,8 +455,8 @@ class Loops(IRNode):
     inner_fn: Callable[..., Any]
     ranges: List[Expr]
 
-    def get_unbacked_symbol_uses(self) -> Set[sympy.Symbol]:
-        return set().union(
+    def get_unbacked_symbol_uses(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet().union(
             *(free_unbacked_symbols(e) for e in self.ranges),
             self.inner_fn_free_unbacked_symbols(),
         )
@@ -550,8 +550,8 @@ class Loops(IRNode):
                     self.get_size(),
                 ).reads
 
-    def get_read_names(self) -> Set[str]:
-        return {dep.name for dep in self.get_reads()}
+    def get_read_names(self) -> OrderedSet[str]:
+        return OrderedSet(dep.name for dep in self.get_reads())
 
     def get_reduction_size(self):
         raise NotImplementedError(
@@ -642,7 +642,7 @@ REDUCTION_COMBINE_FN = {
 def get_reduction_combine_fn(reduction_type, dtype, arg_break_ties_left=True):
     if reduction_type in REDUCTION_COMBINE_FN:
         combine_fn = REDUCTION_COMBINE_FN[reduction_type]
-    elif reduction_type in {"argmax", "argmin"}:
+    elif reduction_type in ("argmax", "argmin"):
 
         def combine_fn(a, b):
             a_value, a_index = a
@@ -708,8 +708,8 @@ class Reduction(Loops):
     def __repr__(self):
         return self.__str__()
 
-    def get_unbacked_symbol_uses(self) -> Set[sympy.Symbol]:
-        return super().get_unbacked_symbol_uses() | set().union(
+    def get_unbacked_symbol_uses(self) -> OrderedSet[sympy.Symbol]:
+        return super().get_unbacked_symbol_uses() | OrderedSet().union(
             *(free_unbacked_symbols(e) for e in self.reduction_ranges)
         )
 
@@ -777,10 +777,10 @@ class Reduction(Loops):
         should_split = (
             not V.graph.has_feature(device, BackendFeature.REDUCE_TO_SINGLE_ELEMENT)
             and reduction_type
-            not in {
+            not in (
                 "argmax",
                 "argmin",
-            }
+            )
             and config.split_reductions
             # We don't support unbacked symints
             and _is_static(reduction_numel_hint)
@@ -1167,14 +1167,14 @@ class Reduction(Loops):
 
     @staticmethod
     def default_accumulator(reduction_type, dtype):
-        if reduction_type in {"max", "argmax"}:
+        if reduction_type in ("max", "argmax"):
             if is_float_dtype(dtype):
                 return float("-inf")
             elif is_boolean_dtype(dtype):
                 return 0
             else:
                 return torch.iinfo(dtype).min
-        if reduction_type in {"min", "argmin"}:
+        if reduction_type in ("min", "argmin"):
             if is_float_dtype(dtype):
                 return float("inf")
             elif is_boolean_dtype(dtype):
@@ -1476,7 +1476,7 @@ class WelfordReduction(Reduction):
         reduction_type: str,
         reduction_hint: ReductionHint = ReductionHint.DEFAULT,
     ):
-        assert reduction_type in {"welford_reduce", "welford_combine"}
+        assert reduction_type in ("welford_reduce", "welford_combine")
 
         reduction_numel = V.graph.sizevars.simplify(sympy_product(reduction_ranges))
 
@@ -1691,14 +1691,14 @@ class Scan(Loops):
 
     # HACK we mimick reduction
 
-    def get_unbacked_symbol_uses(self) -> Set[sympy.Symbol]:
+    def get_unbacked_symbol_uses(self) -> OrderedSet[sympy.Symbol]:
         # TODO: Can combine_fn/reindex close over unbacked symbols? If so, we
         # need to explicitly represent the closure so we can pull out unbacked
         # symbols here
         return (
             super().get_unbacked_symbol_uses()
-            | set().union(*(free_unbacked_symbols(e) for e in self.scan_ranges))
-            | set().union(*(free_unbacked_symbols(e) for e in self.size))
+            | OrderedSet().union(*(free_unbacked_symbols(e) for e in self.scan_ranges))
+            | OrderedSet().union(*(free_unbacked_symbols(e) for e in self.size))
         )
 
     def __post_init__(self):
@@ -1881,11 +1881,11 @@ class Sort(Loops):
 
     # HACK we mimick reduction
 
-    def get_unbacked_symbol_uses(self) -> Set[sympy.Symbol]:
+    def get_unbacked_symbol_uses(self) -> OrderedSet[sympy.Symbol]:
         return (
             super().get_unbacked_symbol_uses()
-            | set().union(*(free_unbacked_symbols(e) for e in self.sort_ranges))
-            | set().union(*(free_unbacked_symbols(e) for e in self.size))
+            | OrderedSet().union(*(free_unbacked_symbols(e) for e in self.sort_ranges))
+            | OrderedSet().union(*(free_unbacked_symbols(e) for e in self.size))
         )
 
     def __post_init__(self):
@@ -2146,7 +2146,7 @@ class BaseView(IRNode):
     def is_module_buffer(self):
         return self.data.is_module_buffer()  # type: ignore[attr-defined]
 
-    def get_read_names(self) -> Set[str]:
+    def get_read_names(self) -> OrderedSet[str]:
         return self.data.get_read_names()
 
     def get_reads(self):
@@ -2247,7 +2247,7 @@ class PermuteView(BaseView):
     @classmethod
     def create(cls, x, dims):
         dims = cls._map_neg_dims(dims)
-        assert set(dims) == set(range(len(dims)))
+        assert OrderedSet(dims) == OrderedSet(range(len(dims)))
 
         if is_storage_and_layout(x):
             storage, old_layout = as_storage_and_layout(x)
@@ -2267,14 +2267,16 @@ class PermuteView(BaseView):
         return [dim if dim >= 0 else len(dims) + dim for dim in dims]
 
     def get_size(self):
-        assert set(self._map_neg_dims(self.dims)) == set(range(len(self.dims)))
+        assert OrderedSet(self._map_neg_dims(self.dims)) == OrderedSet(
+            range(len(self.dims))
+        )
         size = self.data.get_size()
         return [size[i] for i in self.dims]
 
     def make_reindexer(self):
         inv = {j: i for i, j in enumerate(self.dims)}
         inv = [inv[i] for i in range(len(self.dims))]  # type: ignore[index]
-        assert set(inv) == set(range(len(self.dims)))
+        assert OrderedSet(inv) == OrderedSet(range(len(self.dims)))
 
         def reindex(index):
             return [index[i] for i in inv]
@@ -2574,7 +2576,7 @@ class ReinterpretView(BaseView):
     def freeze_layout(self):
         pass
 
-    def get_unbacked_symbol_uses(self) -> Set[sympy.Symbol]:
+    def get_unbacked_symbol_uses(self) -> OrderedSet[sympy.Symbol]:
         return (
             free_unbacked_symbols(self.layout.size)
             | free_unbacked_symbols(self.layout.stride)
@@ -3020,7 +3022,7 @@ class FlexibleLayout(Layout):
         In this format, channels last would be:
             [1, 3, 2, 0]
         """
-        assert set(range(len(sizes))) == set(order), (sizes, order)
+        assert OrderedSet(range(len(sizes))) == OrderedSet(order), (sizes, order)
         next_stride = sympy.Integer(1)
         strides = [None] * len(order)
 
@@ -3037,7 +3039,7 @@ class FlexibleLayout(Layout):
         In this format, channels last would be:
             [3, 0, 2, 1]
         """
-        assert set(range(len(sizes))) == set(order)
+        assert OrderedSet(range(len(sizes))) == OrderedSet(order)
         fill_order = stride_order2fill_order(order)
         return FlexibleLayout.fill_ordered(sizes, fill_order)
 
@@ -3348,14 +3350,14 @@ class Buffer(IRNode):
             return [self.layout.target.get_name()]
         return ()
 
-    def get_read_names(self) -> Set[str]:
-        return {self.get_name()}
+    def get_read_names(self) -> OrderedSet[str]:
+        return OrderedSet([self.get_name()])
 
-    def get_unbacked_symbol_uses(self) -> Set[sympy.Symbol]:
-        return set()
+    def get_unbacked_symbol_uses(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
 
-    def get_unbacked_symbol_defs(self) -> Set[sympy.Symbol]:
-        return set()
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
 
     def realize(self):
         pass
@@ -3403,8 +3405,8 @@ class ConstantBuffer(InputBuffer):
 
 
 class NoneAsConstantBuffer(IRNode):
-    def get_unbacked_symbol_uses(self) -> Set[sympy.Symbol]:
-        return set()
+    def get_unbacked_symbol_uses(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
 
     def codegen_reference(self, writer=None):
         return V.graph.wrapper_code.none_str
@@ -3419,7 +3421,7 @@ class ShapeAsConstantBuffer(IRNode):
     def shape(self):
         return self._shape
 
-    def get_unbacked_symbol_uses(self) -> Set[sympy.Symbol]:
+    def get_unbacked_symbol_uses(self) -> OrderedSet[sympy.Symbol]:
         return free_unbacked_symbols(self.shape)
 
     def codegen_reference(self, writer=None):
@@ -3459,7 +3461,7 @@ class ComputedBuffer(OperationBuffer):
                     self.data.get_size(),
                 )
 
-    def get_unbacked_symbol_uses(self) -> Set[sympy.Symbol]:
+    def get_unbacked_symbol_uses(self) -> OrderedSet[sympy.Symbol]:
         # Ordinarily, we'd like to just peek at the arguments list,
         # but ComputedBuffers have no argument list.
         #
@@ -3800,10 +3802,10 @@ class TritonTemplateBuffer(TemplateBuffer):
         self.outputs: List[Buffer] = [self]
         if mutated_inputs is not None:
             # Ensure that the mutated inputs are only allowed for certain nodes
-            allowed_set = {
+            allowed_set = (
                 torch.ops.higher_order.flex_attention,
                 torch.ops.higher_order.flex_attention_backward,
-            }
+            )
             current_node = V.graph.current_node.target
             assert (
                 current_node in allowed_set
@@ -3947,22 +3949,22 @@ class InputsKernel(OperationBuffer):
         return dependencies.StarDep(x.get_name())
 
     def get_read_writes(self):
-        reads: Set[dependencies.Dep] = set()
+        reads: OrderedSet[dependencies.Dep] = OrderedSet()
         StarDep = dependencies.StarDep
         for input in self.inputs:
             if isinstance(input, list):
-                reads.update({StarDep(x.get_name()) for x in input})
+                reads.update(OrderedSet(StarDep(x.get_name()) for x in input))
             else:
                 reads.add(StarDep(input.get_name()))
 
-        writes: Set[dependencies.Dep] = {
+        writes: OrderedSet[dependencies.Dep] = OrderedSet(
             StarDep(buf.get_name()) for buf in self.get_outputs()
-        }
+        )
 
         return dependencies.ReadWrites(
             reads=reads,
             writes=writes,
-            index_exprs=set(),
+            index_exprs=OrderedSet(),
         )
 
     @classmethod
@@ -4218,8 +4220,8 @@ class ExternKernel(InputsKernel):
     def get_outputs(self) -> List[Buffer]:
         return [self, *self.mutation_outputs]
 
-    def get_unbacked_symbol_defs(self) -> Set[sympy.Symbol]:
-        return set()
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
 
     def collect_arg_kwarg_properties(self):
         # if self.op_overload is torch._ops.OpOverload, we can use its schema to collect additional
@@ -4258,7 +4260,7 @@ class ExternKernel(InputsKernel):
     def fill_non_provided_args(self, args, kwargs, convert_val_to_str=False):
         # Previously, we want to maintain forward-compatibility by skipping
         # default args in the serialized artifacts in fbcode. However,
-        # some of our shim interfaces require default values being set.
+        # some of our shim interfaces require default values being OrderedSet.
         # Discussed with Sherlock offline and we decided to allow serializing
         # default args into the C++ wrapper code for now. We will refine this
         # part if we see real FC requirement. More details related to FC
@@ -4440,7 +4442,7 @@ class ExternKernel(InputsKernel):
         x_unwrap_view_fx_node = V.graph.get_buffer(
             x_unwrap_view.get_name()
         ).get_origin_node()
-        # Prefer channels last format according to how the format is set from eager.
+        # Prefer channels last format according to how the format is OrderedSet from eager.
         if (
             x_unwrap_view_fx_node is not None
             and "val" in x_unwrap_view_fx_node.meta
@@ -4747,10 +4749,10 @@ class ExternKernel(InputsKernel):
         index = sympy_subs(sympy.expand(index), replacement)  # type: ignore[arg-type]
         return index, tuple(new_sizes)
 
-    def get_unbacked_symbol_uses(self) -> Set[sympy.Symbol]:
+    def get_unbacked_symbol_uses(self) -> OrderedSet[sympy.Symbol]:
         # NB: It's not necessary to check regular inputs as we automatically
         # have dependencies on them
-        r = set()
+        r: OrderedSet[sympy.Symbol] = OrderedSet()
         for arg in self.constant_args:
             r |= maybe_free_unbacked_symbols(arg)
         for arg in self.kwargs.values():
@@ -4942,13 +4944,13 @@ class UserDefinedTritonKernel(ExternKernel):
             new_name, self.grid, configs, args, triton_meta, raw_args
         )
 
-    def get_unbacked_symbol_uses(self) -> Set[sympy.Symbol]:
+    def get_unbacked_symbol_uses(self) -> OrderedSet[sympy.Symbol]:
         # add unbacked symbols used in the grid to the ones used
         # in the kwargs (the latter is generated by ExternKernel)
         return super().get_unbacked_symbol_uses() | free_unbacked_symbols(self.grid)
 
-    def get_unbacked_symbol_defs(self) -> Set[sympy.Symbol]:
-        return set()
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
 
     def __init__(self, *, kernel_idx, grid, kernel_args):
         inputs = []
@@ -5030,8 +5032,8 @@ class InplaceBernoulliFallback(ExternKernel):
     def get_mutation_names(self):
         return [self.inputs[0].get_name()]
 
-    def get_unbacked_symbol_defs(self) -> Set[sympy.Symbol]:
-        return set()
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
 
     def __init__(self, op_overload, x, *constant_args):
         super().__init__(
@@ -5068,8 +5070,8 @@ class InplaceCopyFallback(ExternKernel):
     def get_mutation_names(self):
         return [self.inputs[0].get_name()]
 
-    def get_unbacked_symbol_defs(self) -> Set[sympy.Symbol]:
-        return set()
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
 
     def __init__(
         self,
@@ -5123,8 +5125,8 @@ class MutatingFirstArgExternKernel(ExternKernel):
     def get_mutation_names(self):
         return [self.inputs[0].get_name()]
 
-    def get_unbacked_symbol_defs(self) -> Set[sympy.Symbol]:
-        return set()
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
 
     def has_side_effects(self):
         return True
@@ -5204,8 +5206,8 @@ class ScatterFallback(ExternKernel):
     def get_mutation_names(self):
         return [self.inputs[0].get_name()]
 
-    def get_unbacked_symbol_defs(self) -> Set[sympy.Symbol]:
-        return set()
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
 
     def __init__(
         self,
@@ -5269,8 +5271,8 @@ class IndexPutFallback(ExternKernel):
     def get_mutation_names(self):
         return [self.inputs[0].get_name()]
 
-    def get_unbacked_symbol_defs(self) -> Set[sympy.Symbol]:
-        return set()
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
 
     def __init__(self, op_overload, x, indices, values, accumulate):
         self.indices = indices
@@ -5342,8 +5344,8 @@ class DynamicScalar(ExternKernel):
         self.sym = sym
         self.keypath = keypath
 
-    def get_unbacked_symbol_defs(self) -> Set[sympy.Symbol]:
-        return {self.sym}
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet([self.sym])
 
     def codegen(self, wrapper):
         wrapper.codegen_dynamic_scalar(self)
@@ -5403,22 +5405,24 @@ class ExternKernelNode:
     node: export_schema.Node
 
 
-has_c_shim = {
-    aten._embedding_bag.default,
-    aten._fft_c2c.default,
-    aten._scaled_dot_product_efficient_attention.default,
-    aten._scaled_dot_product_flash_attention.default,
-    aten._scaled_dot_product_cudnn_attention.default,
-    aten._scaled_mm.default,
-    aten.addmm.out,
-    aten.bmm.out,
-    aten.copy_.default,
-    aten.mm.out,
-    aten.repeat_interleave.Tensor,
-    aten.nonzero.default,
-    aten.view.dtype,
-    aten.view_as_real.default,
-}
+has_c_shim = OrderedSet(
+    [
+        aten._embedding_bag.default,
+        aten._fft_c2c.default,
+        aten._scaled_dot_product_efficient_attention.default,
+        aten._scaled_dot_product_flash_attention.default,
+        aten._scaled_dot_product_cudnn_attention.default,
+        aten._scaled_mm.default,
+        aten.addmm.out,
+        aten.bmm.out,
+        aten.copy_.default,
+        aten.mm.out,
+        aten.repeat_interleave.Tensor,
+        aten.nonzero.default,
+        aten.view.dtype,
+        aten.view_as_real.default,
+    ]
+)
 
 
 class FallbackKernel(ExternKernelAlloc):
@@ -5604,13 +5608,13 @@ class FallbackKernel(ExternKernelAlloc):
                 f"{wrapper.codegen_unbacked_symbol_decl(s)} = {go_outer()}{wrapper.ending}"
             )
 
-    def get_unbacked_symbol_defs(self) -> Set[sympy.Symbol]:
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
         if unbacked_bindings := getattr(self, "unbacked_bindings", None):
             return resolve_unbacked_bindings(
                 V.graph.sizevars.shape_env, unbacked_bindings
             ).keys()
         else:
-            return set()
+            return OrderedSet()
 
     def set_cpp_kernel(self, kernel):
         from .codegen.wrapper import get_cpp_op_schema
@@ -5988,7 +5992,7 @@ class MultiOutput(ExternKernel):
         V.graph.register_operation(self)
         self.indices = indices
 
-    def get_unbacked_symbol_uses(self) -> Set[sympy.Symbol]:
+    def get_unbacked_symbol_uses(self) -> OrderedSet[sympy.Symbol]:
         return self.inputs[0].get_unbacked_symbol_uses()
 
     def should_allocate(self):
@@ -6020,10 +6024,10 @@ class MutableBox(IRNode):
     def realize(self):
         return self.data.realize()
 
-    def get_unbacked_symbol_uses(self) -> Set[sympy.Symbol]:
+    def get_unbacked_symbol_uses(self) -> OrderedSet[sympy.Symbol]:
         return self.data.get_unbacked_symbol_uses()
 
-    def get_read_names(self) -> Set[str]:
+    def get_read_names(self) -> OrderedSet[str]:
         return self.data.get_read_names()
 
     def get_defining_op(self):
@@ -7016,7 +7020,7 @@ def maybe_free_unbacked_symbols(s):
         # This branch should be impossible in return position
         return free_unbacked_symbols(s)
     elif isinstance(s, (tuple, list)):
-        r = set()
+        r: OrderedSet[sympy.Symbol] = OrderedSet()
         for t in s:
             r |= maybe_free_unbacked_symbols(t)
         return r
@@ -7024,4 +7028,4 @@ def maybe_free_unbacked_symbols(s):
         # This branch is impossible in constant-args position
         return free_unbacked_symbols(s)
     else:
-        return set()
+        return OrderedSet()

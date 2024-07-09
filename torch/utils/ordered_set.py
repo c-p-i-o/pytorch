@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import MutableSet, Set as AbstractSet
-from typing import cast, Iterable, Iterator, Optional, TypeVar
+from typing import Any, cast, Iterable, Iterator, Optional, TypeVar
 
 T = TypeVar("T")
 T_co = TypeVar("T_co", covariant=True)
@@ -13,6 +13,8 @@ class OrderedSet(MutableSet[T]):
     """
     Insertion ordered set, similar to OrderedDict.
     """
+
+    __slots__ = ("_dict",)
 
     def __init__(self, iterable: Optional[Iterable[T]] = None):
         self._dict: dict[T, None] = {}
@@ -45,7 +47,7 @@ class OrderedSet(MutableSet[T]):
     # Unimplemented set() methods in _collections_abc.MutableSet
 
     @classmethod
-    def _wrap_in_set(cls, other: object) -> object:
+    def _wrap_iter_in_set(cls, other: Any) -> Any:
         """
         Wrap non-Set Iterables in OrderedSets
 
@@ -91,10 +93,10 @@ class OrderedSet(MutableSet[T]):
             self &= other  # type: ignore[operator, arg-type]
 
     def issubset(self, other: Iterable[T]) -> bool:
-        return self <= self._wrap_in_set(other)
+        return self <= self._wrap_iter_in_set(other)
 
     def issuperset(self, other: Iterable[T]) -> bool:
-        return self >= self._wrap_in_set(other)
+        return self >= self._wrap_iter_in_set(other)
 
     def symmetric_difference(self, other: Iterable[T]) -> OrderedSet[T]:
         return self ^ other  # type: ignore[operator, arg-type]
