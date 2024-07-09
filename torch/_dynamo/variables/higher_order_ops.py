@@ -1227,6 +1227,7 @@ class FunctorchHigherOrderVariable(UserFunctionVariable):
                 "jacfwd": "jacfwd",
                 "hessian": "hessian",
                 "linearize": "linearize",
+                "functional_call": "functional_call",
             }.get(name)
             assert name is not None
             unimplemented(
