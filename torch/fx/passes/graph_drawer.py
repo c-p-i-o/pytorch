@@ -9,6 +9,7 @@ import torch.fx
 from torch.fx._compatibility import compatibility
 from torch.fx.graph import _parse_stack_trace
 from torch.fx.node import _format_arg, _get_qualified_name
+from torch.fx.operator_schemas import normalize_function
 from torch.fx.passes.shape_prop import TensorMetadata
 
 
@@ -57,6 +58,7 @@ _WEIGHT_TEMPLATE = {
 }
 
 if HAS_PYDOT:
+
     @compatibility(is_backward_compatible=False)
     class FxGraphDrawer:
         """
@@ -75,16 +77,23 @@ if HAS_PYDOT:
             skip_node_names_in_args: bool = True,
             parse_stack_trace: bool = False,
             dot_graph_shape: Optional[str] = None,
+            normalize_args: bool = False,
         ):
             self._name = name
             self.dot_graph_shape = (
                 dot_graph_shape if dot_graph_shape is not None else "record"
             )
+            self.normalize_args = normalize_args
             _WEIGHT_TEMPLATE["shape"] = self.dot_graph_shape
 
             self._dot_graphs = {
                 name: self._to_dot(
-                    graph_module, name, ignore_getattr, ignore_parameters_and_buffers, skip_node_names_in_args, parse_stack_trace
+                    graph_module,
+                    name,
+                    ignore_getattr,
+                    ignore_parameters_and_buffers,
+                    skip_node_names_in_args,
+                    parse_stack_trace,
                 )
             }
 
@@ -96,7 +105,6 @@ if HAS_PYDOT:
 
                 if not isinstance(leaf_node, torch.fx.GraphModule):
                     continue
-
 
                 self._dot_graphs[f"{name}_{node.target}"] = self._to_dot(
                     leaf_node,
@@ -159,7 +167,9 @@ if HAS_PYDOT:
                 # Use a random color for each node; based on its name so it's stable.
                 target_name = node._pretty_print_target(node.target)
                 target_hash = int(hashlib.md5(target_name.encode()).hexdigest()[:8], 16)
-                template["fillcolor"] = _HASH_COLOR_MAP[target_hash % len(_HASH_COLOR_MAP)]
+                template["fillcolor"] = _HASH_COLOR_MAP[
+                    target_hash % len(_HASH_COLOR_MAP)
+                ]
             return template
 
         def _get_leaf_node(
@@ -197,11 +207,10 @@ if HAS_PYDOT:
             full_file_name: str,
             truncate_to_last_n: int = 2,
         ):
-            splits = full_file_name.split('/')
+            splits = full_file_name.split("/")
             if len(splits) >= truncate_to_last_n:
-                return '/'.join(splits[-truncate_to_last_n:])
+                return "/".join(splits[-truncate_to_last_n:])
             return full_file_name
-
 
         def _get_node_label(
             self,
@@ -217,8 +226,7 @@ if HAS_PYDOT:
                 elif isinstance(arg, dict):
                     prefix, suffix = r"|kwargs={\l", r",\n}\l"
                     arg_strs_list = [
-                        f"{k}: {_format_arg(v, max_list_len=8)}"
-                        for k, v in arg.items()
+                        f"{k}: {_format_arg(v, max_list_len=8)}" for k, v in arg.items()
                     ]
                 else:  # Fall back to nothing in unexpected case.
                     return ""
@@ -233,7 +241,6 @@ if HAS_PYDOT:
                     arg_strs = arg_strs.replace(r"\l", "").replace(r"\n", "")
                 return arg_strs.replace("{", r"\{").replace("}", r"\}")
 
-
             label = "{" + f"name=%{node.name}|op_code={node.op}\n"
 
             if node.op == "call_module":
@@ -247,18 +254,29 @@ if HAS_PYDOT:
                 label += extra + r"\n"
             else:
                 label += f"|target={self._typename(node.target)}" + r"\n"
-                if len(node.args) > 0:
-                    label += _get_str_for_args_kwargs(node.args)
-                if len(node.kwargs) > 0:
-                    label += _get_str_for_args_kwargs(node.kwargs)
+                if self.normalize_args:
+                    try:
+                        args, kwargs = normalize_function(
+                            node.target, node.args, node.kwargs, normalize_to_only_use_kwargs=True
+                        )
+                    except Exception:
+                        # Fallback to not normalizing if there's an exception.
+                        # Some functions need overloads specified to normalize.
+                        args, kwargs = node.args, node.kwargs
+                else:
+                    args, kwargs = node.args, node.kwargs
+                if len(args) > 0:
+                    label += _get_str_for_args_kwargs(args)
+                if len(kwargs) > 0:
+                    label += _get_str_for_args_kwargs(kwargs)
                 label += f"|num_users={len(node.users)}" + r"\n"
 
-            tensor_meta = node.meta.get('tensor_meta')
+            tensor_meta = node.meta.get("tensor_meta")
             label += self._tensor_meta_to_label(tensor_meta)
 
             # for original fx graph
             # print buf=buf0, n_origin=6
-            buf_meta = node.meta.get('buf_meta', None)
+            buf_meta = node.meta.get("buf_meta", None)
             if buf_meta is not None:
                 label += f"|buf={buf_meta.name}" + r"\n"
                 label += f"|n_origin={buf_meta.n_origin}" + r"\n"
@@ -268,8 +286,10 @@ if HAS_PYDOT:
             if parse_stack_trace and node.stack_trace is not None:
                 parsed_stack_trace = _parse_stack_trace(node.stack_trace)
                 fname = self._shorten_file_name(parsed_stack_trace.file)
-                label += f"|file={fname}:{parsed_stack_trace.lineno} {parsed_stack_trace.code}" + r"\n"
-
+                label += (
+                    f"|file={fname}:{parsed_stack_trace.lineno} {parsed_stack_trace.code}"
+                    + r"\n"
+                )
 
             return label + "}"
 
@@ -424,6 +444,7 @@ else:
                 skip_node_names_in_args: bool = True,
                 parse_stack_trace: bool = False,
                 dot_graph_shape: Optional[str] = None,
+                normalize_args: bool = False,
             ):
                 raise RuntimeError('FXGraphDrawer requires the pydot package to be installed. Please install '
                                    'pydot through your favorite Python package manager.')
