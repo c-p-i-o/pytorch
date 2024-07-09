@@ -1011,7 +1011,11 @@ class CppVecOverrides(CppOverrides):
                             else:
                                 arg = ops.constant(arg, arg_dtype)
                             arg = arg.value if isinstance(arg, OpsValue) else arg
-                        if isinstance(arg, CppCSEVariable) and not arg.is_vec:
+                        if (
+                            isinstance(arg, CppCSEVariable)
+                            and not arg.is_vec
+                            and func is not CppVecOverrides.randn
+                        ):
                             assert isinstance(V.kernel, CppVecKernel)
                             # align scalar data type to the vector for binary ops
                             if len(args) == 2 and arg.dtype != vec_dtype:
@@ -1256,6 +1260,35 @@ class CppVecOverrides(CppOverrides):
         else:
             assert is_integer_dtype(a.dtype)
             return f"{a} - ({CppVecOverrides.floordiv(a, b)}) * {b}"
+
+    @staticmethod
+    def load_seed(name, offset):
+        assert isinstance(V.kernel, CppVecKernel)
+        return f"{V.kernel.load(name, offset)}"
+
+    @staticmethod
+    def randn(seed, offset):
+        assert isinstance(V.kernel, CppVecKernel)
+        code = BracesBuffer()
+        code.writeline("[&]()")
+        with code.indent():
+            code.writeline(
+                f"{DTYPE_TO_CPP[offset.dtype]} offset[{V.kernel.tiling_factor}];"
+            )
+            code.writeline(
+                f"{DTYPE_TO_CPP[torch.float32]} result[{V.kernel.tiling_factor}];"
+            )
+            code.writeline(f"{offset}.store(offset);")
+            code.writeline(
+                f"for( {DTYPE_TO_CPP[offset.dtype]} offset_idx = 0; offset_idx < {V.kernel.tiling_factor}; offset_idx++ )"
+            )
+            with code.indent():
+                code.writeline(
+                    f"result[offset_idx] = randn_cpu({seed}, offset[offset_idx]);"
+                )
+            code.writeline("return at::vec::Vectorized<float>::loadu(result);")
+        code.writeline("()")
+        return code
 
     @staticmethod
     def tan(a):
@@ -3065,11 +3098,13 @@ class CppVecKernelChecker(CppVecKernel):
                     assert len(self.ranges) == len(self.itervars)
                     opt_ctx: OptimizationContext = node_ctx.get_opt_ctx()
                     assert opt_ctx
+                    support_ops = list(BIN_CMP_OPS)
+                    support_ops.append("randn")
                     if (
                         dtype in [torch.int32, torch.int64]
                         and can_use_int32()
                         and all(
-                            user.target in BIN_CMP_OPS
+                            user.target in support_ops
                             for user in node_ctx.current_node.users
                         )
                     ):
