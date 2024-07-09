@@ -1152,6 +1152,7 @@ class TritonKernel(SIMDKernel):
         reduction_hint=ReductionHint.DEFAULT,
         min_elem_per_thread=0,
         override_persistent_reduction=None,
+        optimize_mask=True,
     ):
         super().__init__(
             *groups,
@@ -1170,6 +1171,7 @@ class TritonKernel(SIMDKernel):
         # A set of autotuning hints to pass as part of triton_meta
         self.autotune_hints: Set[AutotuneHint] = set()
         self.triton_meta: Optional[Dict[str, object]] = None
+        self.optimize_mask: bool = optimize_mask
 
         self.codegen_range_tree()
 
@@ -2845,6 +2847,8 @@ class TritonKernel(SIMDKernel):
         return V.graph.sizevars.statically_known_multiple_of(tree.numel, max_block)
 
     def filter_masks(self, mask_vars):
+        if not self.optimize_mask:
+            return
         for tree in self.range_trees:
             if self._has_constant_mask(tree):
                 mask_vars.discard(f"{tree.prefix}mask")
@@ -3052,3 +3056,132 @@ class TritonScheduling(SIMDScheduling):
         )
         store_cache()
         return ms, mod.__file__
+
+    def benchmark_combo_kernel(self, node_list):
+        from .triton_combo_kernel import ComboKernel
+
+        def cache_file_path():
+            assert mod.__file__ is not None
+            return os.path.splitext(mod.__file__)[0] + ".kernel_perf"
+
+        def load_cache():
+            path = cache_file_path()
+            if os.path.exists(path):
+                with open(path) as fd:
+                    return tuple(float(e) for e in fd.read().split())
+            return (None, None)
+
+        def store_cache():
+            path = cache_file_path()
+            with open(path, "w") as fd:
+                fd.write(str(ms) + " " + str(ms_clone))
+
+        subkernel_nodes = node_list
+        fused_node_lists = [node.get_nodes() for node in subkernel_nodes]
+        subkernel_map, node_schedule_map = {}, {}
+        for pn, nodes in zip(subkernel_nodes, fused_node_lists):
+            _, (numel, rnumel) = max(nodes, key=lambda x: int(x.is_reduction())).group
+            node_schedule = self.generate_node_schedule(nodes, numel, rnumel)
+            tiled_groups = self.select_tiling(node_schedule, numel, rnumel)
+            (
+                reduction_hint_val,
+                mutations,
+                index_dtype,
+            ) = self.get_kernel_args(node_schedule, numel, rnumel)
+            node_schedule_map[pn] = (node_schedule, tiled_groups, numel, rnumel)
+            subkernel_map[pn] = ComboKernel.create_triton_kernel(
+                *tiled_groups,
+                reduction_hint=reduction_hint_val,
+                mutations=mutations,
+                index_dtype=index_dtype,
+            )
+
+        partitions = ComboKernel.horizontal_partition(
+            nodes=subkernel_nodes,
+            triton_scheduling=self,
+            kernel_map=subkernel_map,
+            node_info_map=node_schedule_map,
+            custom_algorithm=True,
+        )
+        log.debug(
+            "ComboKernels: %d nodes partitioned into %s groups",
+            len(subkernel_nodes),
+            [len(p) for p in partitions],
+        )
+        total_ms, file_list = 0, []
+        total_clone_ms = 0
+        removed_buffers_orig = V.graph.removed_buffers
+        V.graph.removed_buffers = set(removed_buffers_orig)
+        inplaced_to_remove_orig = V.graph.inplaced_to_remove
+        V.graph.inplaced_to_remove = set(inplaced_to_remove_orig)
+        enable_autotune = config.combo_kernels_autotune > 0
+        for node_group in partitions:
+            fused_node_lists = [node.get_nodes() for node in node_group]
+            kernel = ComboKernel(enable_autotune=enable_autotune)
+            names = [n.get_name() for nodes in fused_node_lists for n in nodes]
+
+            for pn, nodes in zip(node_group, fused_node_lists):
+                # empty last_usage. May cause more aggressive 'evict_last'. Should be fine.
+                for n in nodes:
+                    n.last_usage = set()
+
+                self.codegen_node_schedule_with_kernel(
+                    node_schedule_map[pn][0],
+                    kernel.create_sub_kernel(subkernel_map[pn]),
+                )
+                subkernel = subkernel_map[pn]
+                V.graph.removed_buffers |= subkernel.removed_buffers
+                V.graph.inplaced_to_remove |= subkernel.inplaced_to_remove
+            with config.patch("benchmark_kernel", True), V.set_kernel_handler(kernel):
+                src_code = kernel.codegen_kernel()
+
+            src_code = src_code.replace(str(Placeholder.KERNEL_NAME), "triton_")
+            mod = PyCodeCache.load(src_code)
+
+            log.debug(
+                "kernel src code for %s written to: %s",
+                names,
+                mod.__file__,
+            )
+            ms, ms_clone = load_cache()
+            if ms is not None:
+                total_ms += ms
+                total_clone_ms += ms_clone
+                file_list.append(mod.__file__)
+                continue
+
+            args = mod.get_args()
+            call = mod.call
+            wrapped_jit_function = mod.triton_
+
+            # call once to trigger the compilation
+            call(wrapped_jit_function.clone_args(*args)[0])
+
+            launchers = wrapped_jit_function.launchers
+            assert len(launchers) == 1
+            if launchers[0].n_spills > 0:
+                # skip benchmarking the kernel if there are register spills
+                ms = ms_clone = float("inf")
+            else:
+                # We have to clone the inplace updated arguments to avoid earlier calls
+                # generating out of range indices for later calls.
+                ms = do_bench_gpu(
+                    lambda: call(wrapped_jit_function.clone_args(*args)[0])
+                )
+                ms_clone = do_bench_gpu(
+                    lambda: wrapped_jit_function.clone_args(*args)[0]
+                )
+
+            log.debug(
+                "The fused kernel for %s took %.3f ms to run, %.3f ms to clone inputs",
+                {n.get_name() for n in nodes},
+                ms,
+                ms_clone,
+            )
+            store_cache()
+            total_ms += ms
+            total_clone_ms += ms_clone
+            file_list.append(mod.__file__)
+        V.graph.removed_buffers = removed_buffers_orig
+        V.graph.inplaced_to_remove = inplaced_to_remove_orig
+        return total_ms, total_clone_ms, file_list
